@@ -73,7 +73,7 @@ async function listLine(line, afterISO){
   do{
     const data=await apiGet(`/api/external/v1/policies/${line}/${encodeURIComponent(ORG)}`,
       { page, page_size:1000, submitted_after:afterISO });
-    for(const it of data.items||[]) out.push({ id:it.policy_id, line, anc:!!it.is_ancillary, status:it.policy_status??null });
+    for(const it of data.items||[]){ if(!global._nsbaFields && it) global._nsbaFields=Object.keys(it); out.push({ id:it.policy_id, line, anc:!!it.is_ancillary, status:it.policy_status??null }); }
     pages=data.total_pages||1; page++;
   } while(page<=pages && page<=10);
   return out;
@@ -140,10 +140,13 @@ async function buildBoards(){
       .map(([e,set])=>({ name:umap[e.toLowerCase()]||e.split("@")[0], sales:set.size }))
       .sort((a,b)=>b.sales-a.sales||a.name.localeCompare(b.name));
   };
+  const statusCounts={};
+  for(const x of lists.flat()){ const s=x.status==null?"(null/Not Set)":String(x.status); statusCounts[s]=(statusCounts[s]||0)+1; }
   return { updated_at:new Date().toISOString(), week_start:wsDate,
     today:tally(todayItems), week:tally(weekItems),
     today_core: todayAll.filter(x=>!x.anc).length,
-    today_ancillary: todayAll.filter(x=>x.anc).length };
+    today_ancillary: todayAll.filter(x=>x.anc).length,
+    _diag: { api_status_values: statusCounts, sample_fields: global._nsbaFields||[] } };
 }
 
 /* ------------------------------- handler ------------------------------- */
