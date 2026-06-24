@@ -29,12 +29,16 @@ const COUNT_ANCILLARY = (process.env.COUNT_ANCILLARY || "true").toLowerCase() !=
 // e.g. EXCLUDE_STATUSES="Not Set,Submitted". Empty = count every status.
 const EXCLUDE_STATUSES = new Set((process.env.EXCLUDE_STATUSES || "")
   .split(",").map(s=>s.trim().toLowerCase()).filter(Boolean));
+// When true, count ONLY policies whose "Verified Sale" custom field = "Verified".
+// Default OFF: set VERIFIED_ONLY=true in Vercel to enable (instant revert by unsetting).
+const VERIFIED_ONLY = (process.env.VERIFIED_ONLY || "false").toLowerCase() === "true";
 const TZ = "America/Los_Angeles";
 const LINES = ["medicare", "health", "life"];
 const CACHE_TTL = 12000;
-const MAX_NEW_DETAILS = 24;
+const MAX_NEW_DETAILS = 40;
 const DETAIL_CONC = 8;
 const TIME_BUDGET_MS = 6000;
+const RECHECK_TTL_MS = 45000;
 const USERS_TTL = 300000;
 
 let cache = { at: 0, data: null };
@@ -81,10 +85,12 @@ async function listLine(line, afterISO){
 // pull agent + client + carrier from the policy detail (one call, all three)
 async function detailInfo(line, id){
   const d=await apiGet(`/api/external/v1/policies/${line}/${encodeURIComponent(ORG)}/${id}`);
+  const cf = (d && d.custom_fields) || {};
   return {
-    email:   d && d.agent  ? (d.agent.email || null) : null,
-    person:  d && d.person ? (d.person.person_id ?? null) : null,
-    carrier: d && d.carrier_name ? String(d.carrier_name).trim().toLowerCase() : null,
+    email:    d && d.agent  ? (d.agent.email || null) : null,
+    person:   d && d.person ? (d.person.person_id ?? null) : null,
+    carrier:  d && d.carrier_name ? String(d.carrier_name).trim().toLowerCase() : null,
+    verified: String(cf["Verified Sale"] ?? "").trim().toLowerCase() === "verified",
   };
 }
 async function userMap(){
@@ -99,12 +105,18 @@ async function userMap(){
   return map;
 }
 async function resolveDetails(ordered){
-  const start=Date.now();
-  const unknown=ordered.filter(x=>!policyInfo.has(x.id)).slice(0, MAX_NEW_DETAILS);
-  for(let i=0;i<unknown.length;i+=DETAIL_CONC){
+  const start=Date.now(), now=Date.now();
+  // Read a policy if we've never seen it, OR (verified-only mode) it isn't
+  // verified yet and is due for a re-check. Verified/cached ones are skipped.
+  const work=ordered.filter(x=>{
+    const info=policyInfo.get(x.id);
+    if(!info) return true;
+    return VERIFIED_ONLY && !info.verified && (now-(info.checkedAt||0))>RECHECK_TTL_MS;
+  }).slice(0, MAX_NEW_DETAILS);
+  for(let i=0;i<work.length;i+=DETAIL_CONC){
     if(Date.now()-start>TIME_BUDGET_MS) break;
-    await Promise.all(unknown.slice(i,i+DETAIL_CONC).map(async x=>{
-      try{ policyInfo.set(x.id, await detailInfo(x.line,x.id)); }catch(e){}
+    await Promise.all(work.slice(i,i+DETAIL_CONC).map(async x=>{
+      try{ const info=await detailInfo(x.line,x.id); info.checkedAt=Date.now(); policyInfo.set(x.id, info); }catch(e){}
     }));
   }
 }
@@ -132,6 +144,7 @@ async function buildBoards(){
     const perAgent={}; // email -> Set of dealKeys
     for(const x of items){
       const info=policyInfo.get(x.id); if(!info) continue;
+      if(VERIFIED_ONLY && !info.verified) continue;
       const email=info.email; if(!email) continue;
       const dealKey = info.person!=null ? `p${info.person}|${info.carrier||""}` : `id${x.id}`;
       (perAgent[email] = perAgent[email] || new Set()).add(dealKey);
@@ -142,11 +155,20 @@ async function buildBoards(){
   };
   const statusCounts={};
   for(const x of lists.flat()){ const s=x.status==null?"(null/Not Set)":String(x.status); statusCounts[s]=(statusCounts[s]||0)+1; }
+  let detailProbe=null;
+  try{
+    const first = lists.slice(3).flat()[0] || lists.flat()[0];
+    if(first){
+      const d=await apiGet(`/api/external/v1/policies/${first.line}/${encodeURIComponent(ORG)}/${first.id}`);
+      detailProbe={ policy_id:first.id, detail_fields:Object.keys(d||{}), custom_fields:(d&&d.custom_fields!==undefined)?d.custom_fields:"(no custom_fields key)" };
+    }
+  }catch(e){ detailProbe={ error:String(e.message).slice(0,160) }; }
+  const cAnc = x => { if(VERIFIED_ONLY){ const i=policyInfo.get(x.id); return i && i.verified; } return true; };
   return { updated_at:new Date().toISOString(), week_start:wsDate,
     today:tally(todayItems), week:tally(weekItems),
-    today_core: todayAll.filter(x=>!x.anc).length,
-    today_ancillary: todayAll.filter(x=>x.anc).length,
-    _diag: { api_status_values: statusCounts, sample_fields: global._nsbaFields||[] } };
+    today_core: todayAll.filter(x=>!x.anc && cAnc(x)).length,
+    today_ancillary: todayAll.filter(x=>x.anc && cAnc(x)).length,
+    _diag: { verified_only:VERIFIED_ONLY, api_status_values: statusCounts, sample_fields: global._nsbaFields||[], detail_probe: detailProbe } };
 }
 
 /* ------------------------------- handler ------------------------------- */
